@@ -1,6 +1,6 @@
 # ERP Documentation Assistant — v2 (Chatbot UI)
 
-A RAG chatbot for your ERP module and process-flow documentation. Answers use
+A RAG chatbot for your ERP module and process flow documentation. Answers use
 your own `.docx` files first; if a question isn't covered by any document, it
 falls back to general knowledge and **clearly labels the answer as such** —
 it never silently blends the two or guesses at document content it doesn't have.
