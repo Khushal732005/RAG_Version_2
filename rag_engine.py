@@ -1,20 +1,14 @@
 """
 rag_engine.py
 -------------
-The actual RAG decision logic, kept separate from any UI. Both main.py (CLI)
-and app.py (Streamlit chat UI) import this, so the behavior is identical in
-both places and you only tune prompts/thresholds in one file.
+All-round ERP AI Assistant
 
-Core idea (anti-hallucination):
-  1. Retrieve the top-k chunks and their relevance scores (0 = unrelated,
-     1 = near-perfect match, thanks to cosine distance configured in vector.py).
-  2. If the best score clears RELEVANCE_THRESHOLD, treat the question as
-     answerable from your documents -> use a strict "context-only" prompt.
-  3. If it doesn't, treat it as out-of-scope for your documents -> use a
-     separate "general knowledge" prompt that explicitly forbids inventing
-     ERP-specific specifics it has no evidence for.
-  4. The UI always tells the user which mode was used, so answers are never
-     silently mixed or misattributed.
+Behavior:
+1. General questions -> LLM general knowledge.
+2. ERP/document-specific questions -> RAG/document knowledge.
+3. If a document-specific question has weak retrieval,
+   the assistant does NOT invent the ERP-specific answer.
+4. Explicit document requests always prefer document retrieval.
 """
 
 from langchain_ollama.llms import OllamaLLM
@@ -22,108 +16,391 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from vector import vector_store, RETRIEVE_K
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 LLM_MODEL = "llama3.2"
 
-# Tune this against your own documents. Chroma's normalized relevance score
-# is roughly: 1.0 = near-identical meaning, 0.5 = loosely related, 0.0 = unrelated.
-# Start at 0.45-0.5 and adjust based on false-positives/negatives you observe.
+# Minimum similarity required for document-grounded answers.
 RELEVANCE_THRESHOLD = 0.45
 
-# Loaded once at import time (this is the biggest speed lever - the model
-# client is reused across every question instead of being re-created per call).
+# Router model
+router_model = OllamaLLM(model=LLM_MODEL)
+
+# Main answering model
 model = OllamaLLM(model=LLM_MODEL)
 
-# ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
-DOC_TEMPLATE = """You are an expert assistant for our company's ERP system.
-Answer the question using ONLY the context excerpts below. Do not add facts
-that are not supported by the context. If the context only partially answers
-the question, explicitly say what is missing rather than filling the gap.
 
-Context from ERP documentation:
+# ============================================================
+# QUESTION ROUTER
+# ============================================================
+
+ROUTER_TEMPLATE = """
+You are a question classifier for an intelligent ERP assistant.
+
+Classify the user's question into exactly ONE category:
+
+DOCUMENT
+GENERAL
+
+Choose DOCUMENT when the user is asking about:
+- Our ERP system
+- Our company's software
+- A specific ERP module
+- A process described in company documents
+- Fields, screens, forms, workflows or functionality
+- Specific business rules
+- Specific configuration
+- Specific company processes
+- Anything that requires information from uploaded documents
+- Questions containing phrases such as:
+  "according to the document"
+  "according to our ERP"
+  "in our system"
+  "in the ERP"
+  "what fields"
+  "what is the process"
+  "what is the workflow"
+
+Choose GENERAL when the user is asking about:
+- General programming
+- Python
+- Java
+- SQL
+- AI
+- Machine Learning
+- LLMs
+- RAG
+- General ERP concepts
+- General business concepts
+- Mathematics
+- Science
+- Technology
+- General knowledge
+- Explanations that do not require company-specific information
+
+IMPORTANT:
+A general ERP question is GENERAL.
+
+Example:
+"What is an ERP?" -> GENERAL
+
+A company-specific ERP question is DOCUMENT.
+
+Example:
+"What is the employee creation process in our ERP?" -> DOCUMENT
+
+Return ONLY:
+DOCUMENT
+
+or
+
+GENERAL
+
+Question:
+{question}
+"""
+
+
+router_prompt = ChatPromptTemplate.from_template(ROUTER_TEMPLATE)
+router_chain = router_prompt | router_model
+
+
+# ============================================================
+# DOCUMENT ANSWERING PROMPT
+# ============================================================
+
+DOC_TEMPLATE = """
+You are an expert assistant for the company's ERP system.
+
+Answer the user's question using the supplied ERP documentation.
+
+IMPORTANT RULES:
+
+1. Use the document context as the source of truth for
+   company-specific information.
+
+2. Do NOT invent company-specific:
+   - module names
+   - field names
+   - workflows
+   - business rules
+   - screen names
+   - button names
+   - configuration
+   - processes
+
+3. If the document contains the answer, explain it clearly.
+
+4. If multiple document sections are relevant, combine them.
+
+5. If the question asks for a process or workflow,
+   explain it step-by-step.
+
+6. If the document only partially answers the question,
+   clearly state what information is available and
+   what information is not available.
+
+7. Do not say "I cannot answer" simply because the
+   exact wording of the question does not appear in
+   the document. Use relevant information from the
+   retrieved context.
+
+ERP DOCUMENTATION:
 {context}
 
-Question: {question}
+USER QUESTION:
+{question}
 
-If this is about a process flow, answer step-by-step in order. Mention which
-document(s) the answer is based on.
+Answer:
 """
 
-GENERAL_TEMPLATE = """You are a helpful, accurate general-knowledge assistant.
-The user's question could not be matched to anything in the internal ERP
-documentation, so answer using your own general knowledge instead.
 
-Rules:
-- Be factually careful. If you're not confident about something, say so
-  rather than guessing.
-- Do NOT invent specifics about THIS company's ERP setup - module names,
-  field names, button labels, or workflows - since you have no document
-  evidence for those. Stick to general, widely-applicable knowledge
-  (e.g. how ERP systems typically handle this).
-- Be concise and directly useful.
+doc_prompt = ChatPromptTemplate.from_template(DOC_TEMPLATE)
+doc_chain = doc_prompt | model
 
-Question: {question}
+
+# ============================================================
+# GENERAL KNOWLEDGE PROMPT
+# ============================================================
+
+GENERAL_TEMPLATE = """
+You are an intelligent, helpful, all-round AI assistant.
+
+Answer the user's question using your general knowledge.
+
+You can answer questions about:
+
+- Python
+- Java
+- SQL
+- Programming
+- Artificial Intelligence
+- Machine Learning
+- Deep Learning
+- LLMs
+- RAG
+- APIs
+- Databases
+- ERP concepts
+- Software development
+- Mathematics
+- Science
+- Technology
+- Business concepts
+- General knowledge
+
+IMPORTANT:
+
+1. Give a useful and complete answer.
+
+2. Do not unnecessarily say:
+   "I don't have information in the documents."
+
+3. The absence of information in the company's
+   documents does NOT mean that you cannot answer.
+
+4. Do not invent company-specific ERP information.
+
+5. If the user asks for company-specific information
+   and you do not have sufficient document evidence,
+   clearly say that the company-specific information
+   is not available in the provided documentation.
+
+6. Explain concepts simply and provide examples when useful.
+
+USER QUESTION:
+{question}
+
+Answer:
 """
 
-doc_chain = ChatPromptTemplate.from_template(DOC_TEMPLATE) | model
-general_chain = ChatPromptTemplate.from_template(GENERAL_TEMPLATE) | model
 
+general_prompt = ChatPromptTemplate.from_template(GENERAL_TEMPLATE)
+general_chain = general_prompt | model
+
+
+# ============================================================
+# ROUTER FUNCTION
+# ============================================================
+
+def classify_question(question: str) -> str:
+    """
+    Classify question as DOCUMENT or GENERAL.
+    """
+
+    try:
+        result = router_chain.invoke({
+            "question": question
+        })
+
+        result = str(result).strip().upper()
+
+        if "DOCUMENT" in result:
+            return "DOCUMENT"
+
+        return "GENERAL"
+
+    except Exception as e:
+        print(f"Router error: {e}")
+
+        # Safe fallback:
+        # use retrieval if router fails.
+        return "DOCUMENT"
+
+
+# ============================================================
+# DOCUMENT RETRIEVAL
+# ============================================================
 
 def retrieve_relevant_chunks(question: str, k: int = RETRIEVE_K):
-    """
-    Returns (chunks, is_relevant, top_score).
-    chunks: the Document objects to use as context (empty if none pass the bar)
-    is_relevant: whether the top match clears RELEVANCE_THRESHOLD
-    top_score: the best relevance score seen, for display/debugging
-    """
-    results = vector_store.similarity_search_with_relevance_scores(question, k=k)
+
+    results = vector_store.similarity_search_with_relevance_scores(
+        question,
+        k=k
+    )
+
     if not results:
         return [], False, 0.0
 
     top_score = max(score for _, score in results)
-    is_relevant = top_score >= RELEVANCE_THRESHOLD
-    chunks = [doc for doc, score in results if score >= RELEVANCE_THRESHOLD]
-    return chunks, is_relevant, round(top_score, 3)
+
+    chunks = [
+        doc
+        for doc, score in results
+        if score >= RELEVANCE_THRESHOLD
+    ]
+
+    is_relevant = len(chunks) > 0
+
+    return (
+        chunks,
+        is_relevant,
+        round(top_score, 3)
+    )
 
 
-def format_context(chunks) -> str:
+# ============================================================
+# FORMAT DOCUMENT CONTEXT
+# ============================================================
+
+def format_context(chunks):
+
     return "\n\n".join(
-        f"[Source: {c.metadata.get('filename', 'unknown')}]\n{c.page_content}"
+        f"""
+[Source: {c.metadata.get('filename', 'unknown')}]
+
+{c.page_content}
+"""
         for c in chunks
     )
 
 
+# ============================================================
+# MAIN STREAMING FUNCTION
+# ============================================================
+
 def answer_stream(question: str):
-    """
-    Generator. First yield is always a metadata dict:
-        {"mode": "document"|"general", "sources": [...], "score": float}
-    Every subsequent yield is a text token to append to the answer.
-    Streaming (rather than waiting for the full response) is what makes the
-    UI feel fast even though local LLMs generate token-by-token.
-    """
-    chunks, is_relevant, top_score = retrieve_relevant_chunks(question)
+
+    question_type = classify_question(question)
+
+    # --------------------------------------------------------
+    # GENERAL QUESTION
+    # --------------------------------------------------------
+
+    if question_type == "GENERAL":
+
+        yield {
+            "mode": "general",
+            "sources": [],
+            "score": 0.0
+        }
+
+        stream = general_chain.stream({
+            "question": question
+        })
+
+        for token in stream:
+            yield token
+
+        return
+
+
+    # --------------------------------------------------------
+    # DOCUMENT QUESTION
+    # --------------------------------------------------------
+
+    chunks, is_relevant, top_score = retrieve_relevant_chunks(
+        question
+    )
+
+    # --------------------------------------------------------
+    # Document found
+    # --------------------------------------------------------
 
     if is_relevant:
+
         context = format_context(chunks)
-        sources = sorted({c.metadata.get("filename", "unknown") for c in chunks})
-        yield {"mode": "document", "sources": sources, "score": top_score}
-        stream = doc_chain.stream({"context": context, "question": question})
-    else:
-        yield {"mode": "general", "sources": [], "score": top_score}
-        stream = general_chain.stream({"question": question})
 
-    for token in stream:
-        yield token
+        sources = sorted({
+            c.metadata.get(
+                "filename",
+                "unknown"
+            )
+            for c in chunks
+        })
 
+        yield {
+            "mode": "document",
+            "sources": sources,
+            "score": top_score
+        }
+
+        stream = doc_chain.stream({
+            "context": context,
+            "question": question
+        })
+
+        for token in stream:
+            yield token
+
+        return
+
+
+    # --------------------------------------------------------
+    # Document question but no sufficient evidence
+    # --------------------------------------------------------
+
+    yield {
+        "mode": "document_not_found",
+        "sources": [],
+        "score": top_score
+    }
+
+    fallback_message = (
+        "I couldn't find sufficient information about this "
+        "specific ERP functionality in the provided documents. "
+        "I don't want to invent company-specific details."
+    )
+
+    yield fallback_message
+
+
+# ============================================================
+# NON-STREAMING ANSWER
+# ============================================================
 
 def answer(question: str) -> dict:
-    """Non-streaming convenience wrapper (used by the CLI). Returns full answer + metadata."""
+
     gen = answer_stream(question)
+
     meta = next(gen)
+
     text = "".join(gen)
+
     meta["answer"] = text
+
     return meta
+
